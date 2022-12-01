@@ -119,7 +119,7 @@ class DISTGAIL(SAC):
         ).to(self.device)
 
         self.discrim_optimizer = Optimizer(
-            optim_config["discrim"], self.actor.parameters(), lr=optim_config["discrim_lr"]
+            optim_config["discrim"], self.discrim.parameters(), lr=optim_config["discrim_lr"]
         )
 
 
