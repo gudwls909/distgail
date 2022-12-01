@@ -63,6 +63,11 @@ class REINFORCE(BaseAgent):
         self.run_step = run_step
         self.lr_decay = lr_decay
 
+        #########################
+        self.state_size = state_size
+        self.action_size = action_size
+        ######################### e
+
     @torch.no_grad()
     def act(self, state, training=True):
         self.network.train(training)

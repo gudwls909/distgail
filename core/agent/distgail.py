@@ -4,7 +4,7 @@ torch.backends.cudnn.benchmark = True
 import torch.nn.functional as F
 from torch.distributions import Normal, Categorical
 import os
-#import numpy as np
+import numpy as np
 
 from core.network import Network
 from core.optimizer import Optimizer
@@ -12,10 +12,10 @@ from core.buffer import ReplayBuffer
 #from .base import BaseAgent
 
 import pickle
-from .sac import SAC
+#from .sac import SAC
+from .ppo import PPO
 
-
-class DISTGAIL(SAC):
+class DISTGAIL(PPO):
     """Soft actor critic (SAC) agent.
     Args:
         state_size (int): dimension of state.
@@ -41,17 +41,10 @@ class DISTGAIL(SAC):
 
     def __init__(
         self,
-        state_size,
-        action_size,
         discrim="discrim_network",
         head="mlp",
         optim_config={
-            "actor": "adam",
-            "critic": "adam",
-            "alpha": "adam",
-            "actor_lr": 5e-4,
-            "critic_lr": 1e-3,
-            "alpha_lr": 3e-4,
+            "name": "adam",
             "discrim": "adam",
             "discrim_lr": 5e-4
         },
@@ -59,88 +52,35 @@ class DISTGAIL(SAC):
         buffer_size=50000,
         **kwargs,
     ):
-        ####################
-        """
-        self.device = (
-            torch.device(device)
-            if device
-            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        self.action_type = actor.split("_")[0]
 
-        self.actor = Network(
-            actor, state_size, action_size, D_hidden=hidden_size, head=head
-        ).to(self.device)
-        self.actor_optimizer = Optimizer(
-            optim_config["actor"], self.actor.parameters(), lr=optim_config["actor_lr"]
-        )
-
-        (self.critic1, self.target_critic1, self.critic_optimizer1,) = self.critic_set(
-            critic, state_size, action_size, hidden_size, head, optim_config
-        )
-        (self.critic2, self.target_critic2, self.critic_optimizer2,) = self.critic_set(
-            critic, state_size, action_size, hidden_size, head, optim_config
-        )
-
-        self.use_dynamic_alpha = use_dynamic_alpha
-        if use_dynamic_alpha:
-            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-            self.alpha_optimizer = Optimizer(
-                optim_config["alpha"], [self.log_alpha], lr=optim_config["alpha_lr"]
-            )
-        else:
-            self.log_alpha = torch.tensor(static_log_alpha).to(self.device)
-            self.alpha_optimizer = None
-        self.alpha = self.log_alpha.exp()
-
-        if self.action_type == "continuous":
-            self.target_entropy = -action_size
-        else:
-            self.target_entropy = -np.log(1 / action_size) * 0.98
-
-        self.gamma = gamma
-        self.tau = tau
-        self.memory = ReplayBuffer(buffer_size)
-        self.batch_size = batch_size
-        self.start_train_step = start_train_step
-        self.run_step = run_step
-        self.lr_decay = lr_decay
-        self.num_learn = 0
-
-        self.target_update_stamp = 0
-        self.time_t = 0
-        self.target_update_period = target_update_period
-        """
-
-        super(DISTGAIL, self).__init__(state_size, action_size, **kwargs)
+        super(DISTGAIL, self).__init__(**kwargs)
 
         self.discrim = Network(
-            discrim, state_size, action_size, D_hidden=hidden_size, head=head
+            discrim, self.state_size, self.action_size, D_hidden=hidden_size, head=head
         ).to(self.device)
 
         self.discrim_optimizer = Optimizer(
-            optim_config["discrim"], self.actor.parameters(), lr=optim_config["discrim_lr"]
+            optim_config["discrim"], self.discrim.parameters(), lr=optim_config["discrim_lr"]
         )
 
-
+        self.memory = ReplayBuffer(buffer_size)
         self.memory_expert = ReplayBuffer(buffer_size)
         with open("./expert_data/sac.hopper.continuous.pickle", "rb") as fr:
             data_expert = pickle.load(fr)
         for i in range(len(data_expert)):
             self.memory_expert.store([data_expert[i]])
 
-        ###################### #e
 
     @torch.no_grad()
     def act(self, state, training=True):
-        self.actor.train(training)
+        self.network.train(training)
 
         if self.action_type == "continuous":
-            mu, std = self.actor(self.as_tensor(state))
+            mu, std, _ = self.network(self.as_tensor(state))
             z = torch.normal(mu, std) if training else mu
             action = torch.tanh(z)
         else:
-            pi = self.actor(self.as_tensor(state))
+            pi, _ = self.network(self.as_tensor(state))
             action = (
                 torch.multinomial(pi, 1)
                 if training
@@ -149,15 +89,6 @@ class DISTGAIL(SAC):
         action = action.cpu().numpy()
         return {"action": action}
 
-    def sample_action(self, mu, std):
-        m = Normal(mu, std)
-        z = m.rsample()
-        action = torch.tanh(z)
-        log_prob = m.log_prob(z)
-        # Enforcing Action Bounds
-        log_prob -= torch.log(1 - action.pow(2) + 1e-7)
-        log_prob = log_prob.sum(1, keepdim=True)
-        return action, log_prob
 
     def learn(self):
         transitions = self.memory.sample(self.batch_size)
@@ -184,7 +115,6 @@ class DISTGAIL(SAC):
 
 
         #####################  discrim learning
-
         if self.action_type == "continuous":
             gen_output = self.discrim(state, action)
             expert_output = self.discrim(state_expert, action_expert)
@@ -206,119 +136,117 @@ class DISTGAIL(SAC):
                 discrim_loss_fn(expert_output, torch.zeros((state.shape[0], 1)).to(self.device))
             discrim_loss.backward()
             self.discrim_optimizer.step()
-
         #####################  discrim learning #e
 
-
-        if self.action_type == "continuous":
-            q1 = self.critic1(state, action)
-            q2 = self.critic2(state, action)
-
-            with torch.no_grad():
-                mu, std = self.actor(next_state)
-                next_action, next_log_prob = self.sample_action(mu, std)
-                next_q1 = self.target_critic1(next_state, next_action)
-                next_q2 = self.target_critic2(next_state, next_action)
-                entropy = -next_log_prob
-        else:
-            q1 = self.critic1(state).gather(1, action.long())
-            q2 = self.critic2(state).gather(1, action.long())
-
-            with torch.no_grad():
-                next_pi = self.actor(next_state)
-                next_q1 = (next_pi * self.target_critic1(next_state)).sum(
-                    -1, keepdim=True
-                )
-                next_q2 = (next_pi * self.target_critic2(next_state)).sum(
-                    -1, keepdim=True
-                )
-                m = Categorical(next_pi)
-                entropy = m.entropy().unsqueeze(-1)
-
         #####################  generator learning
-
         reward = -torch.log(gen_output)
-
         #####################  generator learning #e
 
+        # set prob_a_old and advantage
         with torch.no_grad():
-            min_next_q = torch.min(next_q1, next_q2)
-            target_q = reward + (1 - done) * self.gamma * (
-                min_next_q + self.alpha * entropy
-            )
+            if self.action_type == "continuous":
+                mu, std, value = self.network(state)
+                m = Normal(mu, std)
+                z = torch.atanh(torch.clamp(action, -1 + 1e-7, 1 - 1e-7))
+                log_prob = m.log_prob(z)
+            else:
+                pi, value = self.network(state)
+                log_prob = pi.gather(1, action.long()).log()
+            log_prob_old = log_prob
 
-        max_Q = torch.max(target_q, axis=0).values.cpu().numpy()[0]
+            next_value = self.network(next_state)[-1]
+            delta = reward + (1 - done) * self.gamma * next_value - value
+            adv = delta.clone()
+            adv, done = adv.view(-1, self.n_step), done.view(-1, self.n_step)
+            for t in reversed(range(self.n_step - 1)):
+                adv[:, t] += (
+                        (1 - done[:, t]) * self.gamma * self._lambda * adv[:, t + 1]
+                )
 
+            ret = adv.view(-1, 1) + value
 
-        # Critic
-        critic_loss1 = F.mse_loss(q1, target_q)
-        critic_loss2 = F.mse_loss(q2, target_q)
+            if self.use_standardization:
+                adv = (adv - adv.mean(dim=1, keepdim=True)) / (
+                        adv.std(dim=1, keepdim=True) + 1e-7
+                )
 
-        self.critic_optimizer1.zero_grad(set_to_none=True)
-        critic_loss1.backward()
-        self.critic_optimizer1.step()
+            adv = adv.view(-1, 1)
 
-        self.critic_optimizer2.zero_grad(set_to_none=True)
-        critic_loss2.backward()
-        self.critic_optimizer2.step()
+        mean_ret = ret.mean().item()
 
-        # Actor
-        if self.action_type == "continuous":
-            mu, std = self.actor(state)
-            sample_action, log_prob = self.sample_action(mu, std)
-            q1 = self.critic1(state, sample_action)
-            q2 = self.critic2(state, sample_action)
-            entropy = -log_prob
-        else:
-            pi = self.actor(state)
-            q1 = (pi * self.critic1(state)).sum(-1, keepdim=True)
-            q2 = (pi * self.critic2(state)).sum(-1, keepdim=True)
-            m = Categorical(pi)
-            entropy = m.entropy().unsqueeze(-1)
+        # start train iteration
+        actor_losses, critic_losses, entropy_losses, ratios, probs = [], [], [], [], []
+        idxs = np.arange(len(reward))
+        for _ in range(self.n_epoch):
+            np.random.shuffle(idxs)
+            for offset in range(0, len(reward), self.batch_size):
+                idx = idxs[offset: offset + self.batch_size]
 
-        min_q = torch.min(q1, q2)
-        actor_loss = -((self.alpha.detach() * entropy) + min_q).mean()
-        self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
-        self.actor_optimizer.step()
+                _state, _action, _value, _ret, _adv, _log_prob_old = map(
+                    lambda x: [_x[idx] for _x in x] if isinstance(x, list) else x[idx],
+                    [state, action, value, ret, adv, log_prob_old],
+                )
 
+                if self.action_type == "continuous":
+                    mu, std, value_pred = self.network(_state)
+                    m = Normal(mu, std)
+                    z = torch.atanh(torch.clamp(_action, -1 + 1e-7, 1 - 1e-7))
+                    log_prob = m.log_prob(z)
+                else:
+                    pi, value_pred = self.network(_state)
+                    m = Categorical(pi)
+                    log_prob = m.log_prob(_action.squeeze(-1)).unsqueeze(-1)
 
-        # Alpha
-        alpha_loss = self.log_alpha * (entropy - self.target_entropy).detach().mean()
+                ratio = (log_prob - _log_prob_old).sum(1, keepdim=True).exp()
+                surr1 = ratio * _adv
+                surr2 = (
+                        torch.clamp(
+                            ratio, min=1 - self.epsilon_clip, max=1 + self.epsilon_clip
+                        )
+                        * _adv
+                )
+                actor_loss = -torch.min(surr1, surr2).mean()
 
-        self.alpha = self.log_alpha.exp()
+                value_pred_clipped = _value + torch.clamp(
+                    value_pred - _value, -self.epsilon_clip, self.epsilon_clip
+                )
 
-        if self.use_dynamic_alpha:
-            self.alpha_optimizer.zero_grad(set_to_none=True)
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
+                critic_loss1 = F.mse_loss(value_pred, _ret)
+                critic_loss2 = F.mse_loss(value_pred_clipped, _ret)
 
-        self.num_learn += 1
+                critic_loss = torch.max(critic_loss1, critic_loss2).mean()
+
+                entropy_loss = -m.entropy().mean()
+
+                loss = (
+                        actor_loss
+                        + self.vf_coef * critic_loss
+                        + self.ent_coef * entropy_loss
+                )
+
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.network.parameters(), self.clip_grad_norm
+                )
+                self.optimizer.step()
+
+                probs.append(log_prob.exp().min().item())
+                ratios.append(ratio.max().item())
+                actor_losses.append(actor_loss.item())
+                critic_losses.append(critic_loss.item())
+                entropy_losses.append(entropy_loss.item())
 
         result = {
-            "critic_loss1": critic_loss1.item(),
-            "critic_loss2": critic_loss2.item(),
-            "actor_loss": actor_loss.item(),
-            "alpha_loss": alpha_loss.item(),
-            "max_Q": max_Q,
-            "mean_Q": min_q.mean().item(),
-            "alpha": self.alpha.item(),
-            "entropy": entropy.mean().item(),
-            #####################
-            "discrim_loss": discrim_loss.item()
-            ##################### #e
+            "actor_loss": np.mean(actor_losses),
+            "critic_loss": np.mean(critic_losses),
+            "entropy_loss": np.mean(entropy_losses),
+            "discrim_loss": discrim_loss.item(),
+            "max_ratio": max(ratios),
+            "min_prob": min(probs),
+            "mean_ret": mean_ret,
         }
         return result
-
-    def update_target_soft(self):
-        for t_p, p in zip(self.target_critic1.parameters(), self.critic1.parameters()):
-            t_p.data.copy_(self.tau * p.data + (1 - self.tau) * t_p.data)
-        for t_p, p in zip(self.target_critic2.parameters(), self.critic2.parameters()):
-            t_p.data.copy_(self.tau * p.data + (1 - self.tau) * t_p.data)
-
-    def update_target_hard(self):
-        self.target_critic1.load_state_dict(self.critic1.state_dict())
-        self.target_critic2.load_state_dict(self.critic2.state_dict())
 
     def process(self, transitions, step):
         result = {}
@@ -326,75 +254,35 @@ class DISTGAIL(SAC):
         self.memory.store(transitions)
         delta_t = step - self.time_t
         self.time_t = step
-        self.target_update_stamp += delta_t
+        self.learn_stamp += delta_t
 
-        if self.memory.size > self.batch_size and step >= self.start_train_step:
+        # Process per epi
+        if self.learn_stamp >= self.n_step:
             result = self.learn()
-
             if self.lr_decay:
-                self.learning_rate_decay(
-                    step,
-                    [
-                        self.actor_optimizer,
-                        self.critic_optimizer1,
-                        self.critic_optimizer2,
-                        ############
-                        self.discrim_optimizer
-                        ############ #e
-                    ],
-                )
-
-        if self.num_learn > 0:
-            if self.action_type == "continuous":
-                self.update_target_soft()
-            else:
-                if self.target_update_stamp >= self.target_update_period:
-                    self.update_target_hard()
-                    self.target_update_stamp = 0
+                self.learning_rate_decay(step)
+            self.learn_stamp = 0
 
         return result
 
     def save(self, path):
         print(f"...Save model to {path}...")
-        save_dict = {
-            "actor": self.actor.state_dict(),
-            "actor_optimizer": self.actor_optimizer.state_dict(),
-            "critic1": self.critic1.state_dict(),
-            "critic2": self.critic2.state_dict(),
-            "critic_optimizer1": self.critic_optimizer1.state_dict(),
-            "critic_optimizer2": self.critic_optimizer2.state_dict(),
-        }
-        if self.use_dynamic_alpha:
-            save_dict["log_alpha"] = self.log_alpha
-            save_dict["alpha_optimizer"] = self.alpha_optimizer.state_dict()
-
-        torch.save(save_dict, os.path.join(path, "ckpt"))
+        torch.save(
+            {
+                "network": self.network.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                #############
+                "discrim": self.discrim.state_dict(),
+                ############# e
+            },
+            os.path.join(path, "ckpt"),
+        )
 
     def load(self, path):
         print(f"...Load model from {path}...")
         checkpoint = torch.load(os.path.join(path, "ckpt"), map_location=self.device)
-        self.actor.load_state_dict(checkpoint["actor"])
-        self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
-
-        self.critic1.load_state_dict(checkpoint["critic1"])
-        self.critic1.load_state_dict(checkpoint["critic2"])
-        self.target_critic1.load_state_dict(self.critic1.state_dict())
-        self.target_critic2.load_state_dict(self.critic2.state_dict())
-        self.critic_optimizer1.load_state_dict(checkpoint["critic_optimizer1"])
-        self.critic_optimizer2.load_state_dict(checkpoint["critic_optimizer2"])
-
-        if self.use_dynamic_alpha and "log_alpha" in checkpoint.keys():
-            self.log_alpha = checkpoint["log_alpha"]
-            self.alpha_optimizer.load_state_dict(checkpoint["alpha_optimizer"])
-
-    def sync_in(self, weights):
-        self.actor.load_state_dict(weights)
-
-    def sync_out(self, device="cpu"):
-        weights = self.actor.state_dict()
-        for k, v in weights.items():
-            weights[k] = v.to(device)
-        sync_item = {
-            "weights": weights,
-        }
-        return sync_item
+        self.network.load_state_dict(checkpoint["network"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        ################
+        self.discrim.load_state_dict(checkpoint["discrim"])
+        ################ e
